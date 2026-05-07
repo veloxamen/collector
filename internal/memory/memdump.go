@@ -25,7 +25,8 @@ type DumpResult struct {
 }
 
 // AcquireAndCompress dumps physical memory via winpmem and returns a compressed ZIP.
-// It creates a temporary raw file which is removed after compression.
+// It creates a temporary raw file which is removed after compression to reduce
+// the footprint on the evidence drive and avoid RAM contamination.
 func AcquireAndCompress(hostname string) (*DumpResult, error) {
 	winpmem, err := resolveWinpmem()
 	if err != nil {
