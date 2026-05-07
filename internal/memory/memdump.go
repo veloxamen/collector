@@ -1,15 +1,7 @@
 //go:build windows
 
-// Package memory acquires a physical memory dump using winpmem,
-// compresses it to a ZIP archive, and returns the compressed bytes
-// for embedding as a named entry in the collector's encrypted bundle.
-//
-// Acquisition flow:
-//  1. Locate winpmem executable (multiple name candidates)
-//  2. Run: winpmem.exe acquire <tempfile.raw>
-//  3. ZIP-compress the raw dump in memory
-//  4. Delete the temporary raw file
-//  5. Return the ZIP bytes for the caller to write as "memdump.zip"
+// Package memory provides physical memory acquisition using winpmem.
+// It captures RAM, compresses it to ZIP, and manages temporary raw files.
 package memory
 
 import (
@@ -25,17 +17,15 @@ import (
 	"time"
 )
 
-// DumpResult holds metadata about a completed memory acquisition.
+// DumpResult contains the outcome and metadata of a memory acquisition process.
 type DumpResult struct {
 	ZipData    []byte  // compressed ZIP archive bytes
 	RawBytes   int64   // size of the raw dump before compression
 	ElapsedSec float64 // total wall-clock seconds
 }
 
-// AcquireAndCompress dumps physical memory with winpmem and returns
-// the result as a ZIP-compressed byte slice.
-//
-// The ZIP archive contains a single entry named "<hostname>_memory.raw".
+// AcquireAndCompress dumps physical memory via winpmem and returns a compressed ZIP.
+// It creates a temporary raw file which is removed after compression.
 func AcquireAndCompress(hostname string) (*DumpResult, error) {
 	winpmem, err := resolveWinpmem()
 	if err != nil {
@@ -96,8 +86,7 @@ func AcquireAndCompress(hostname string) (*DumpResult, error) {
 	}, nil
 }
 
-// compressToZip reads rawFile and returns a ZIP archive as bytes,
-// with the entry named entryName.
+// compressFileToMemory reads a file from disk and returns its ZIP-compressed bytes.
 func compressToZip(rawFile, entryName string) ([]byte, error) {
 	src, err := os.Open(rawFile)
 	if err != nil {
@@ -120,6 +109,7 @@ func compressToZip(rawFile, entryName string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// resolveWinpmem searches for a winpmem executable in the collector's directory.
 func resolveWinpmem() (string, error) {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -127,6 +117,7 @@ func resolveWinpmem() (string, error) {
 	}
 	exeDir := filepath.Dir(exePath)
 
+	// Make list of conseivable winpmem file names.
 	candidates := []string{
 		"go-winpmem_amd64_1.0-rc2_signed.exe", // current recommendation
 		"go-winpmem.exe",                      // for future renaming
@@ -143,6 +134,7 @@ func resolveWinpmem() (string, error) {
 	)
 }
 
+// formatBytes returns a human-readable string representation of a file size.
 func formatBytes(b uint64) string {
 	const (
 		KB = uint64(1024)

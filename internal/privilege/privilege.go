@@ -1,6 +1,6 @@
 //go:build windows
 
-// Package privilege handles UAC self-elevation and Windows privilege enabling.
+// Package privilege handles UAC self-elevation and Windows-specific privilege management.
 package privilege
 
 import (
@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// IsAdmin returns true if the current process is running as Administrator.
+// IsAdmin checks if the current process is running with administrative privileges.
 func IsAdmin() bool {
 	var sid *windows.SID
 	err := windows.AllocateAndInitializeSid(
@@ -31,8 +31,7 @@ func IsAdmin() bool {
 	return err == nil && member
 }
 
-// RelaunchElevated re-launches the current executable with "runas" (UAC prompt).
-// The caller should exit(0) immediately after this returns nil.
+// RelaunchElevated attempts to re-launch the current executable with the "runas" verb.
 func RelaunchElevated() error {
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	exe, _ := syscall.UTF16PtrFromString(os.Args[0])
@@ -55,8 +54,7 @@ func RelaunchElevated() error {
 	return nil
 }
 
-// EnableBackupPrivilege enables SeBackupPrivilege, SeSecurityPrivilege, and
-// SeRestorePrivilege on the current process token (required for raw NTFS access).
+// buildArgString escapes and joins command-line arguments.
 func EnableBackupPrivilege() error {
 	privs := []string{
 		"SeBackupPrivilege",
@@ -79,6 +77,7 @@ func EnableBackupPrivilege() error {
 	return nil
 }
 
+// EnableBackupPrivilege enables SeBackupPrivilege on the current process token.
 func enablePrivilege(token windows.Token, name string) error {
 	var luid windows.LUID
 	namePtr, err := windows.UTF16PtrFromString(name)
@@ -99,12 +98,11 @@ func enablePrivilege(token windows.Token, name string) error {
 }
 
 // EnableDebugPrivilege enables SeDebugPrivilege on the current process token.
-// winpmem may succeed even without it on some configurations, so failure is
-// treated as a warning rather than a fatal error by the caller.
 func EnableDebugPrivilege() error {
 	return enableNamedPrivilege("SeDebugPrivilege")
 }
 
+// enableNamedPrivilege looks up and enables a specific Windows privilege by name.
 func enableNamedPrivilege(name string) error {
 	var token windows.Token
 	if err := windows.OpenProcessToken(
@@ -131,6 +129,7 @@ func enableNamedPrivilege(name string) error {
 		uint32(unsafe.Sizeof(tp)), nil, nil)
 }
 
+// buildArgString concatenates strings to make command arguments for a new console.
 func buildArgString(args []string) string {
 	var sb strings.Builder
 	for i, a := range args {

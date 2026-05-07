@@ -1,6 +1,8 @@
 //go:build windows
 
-package crypto
+// Package vault provides RSA-OAEP and AES-256-GCM encryption capabilities
+// for the forensic artifact collector.
+package vault
 
 import (
 	"crypto/rsa"
@@ -12,8 +14,8 @@ import (
 	"strings"
 )
 
-// LoadPublicKey reads an RSA public key from a .pub file.
-// Supports PKIX ("PUBLIC KEY") and PKCS#1 ("RSA PUBLIC KEY") PEM formats.
+// LoadPublicKey reads and parses an RSA public key from a PEM-encoded file.
+// Supports both PKIX (SubjectPublicKeyInfo) and PKCS#1 PEM formats.
 func LoadPublicKey(path string) (*rsa.PublicKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -41,37 +43,8 @@ func LoadPublicKey(path string) (*rsa.PublicKey, error) {
 	}
 }
 
-// LoadPrivateKey reads an RSA private key from a .pri file.
-// Supports PKCS#1 ("RSA PRIVATE KEY") and PKCS#8 ("PRIVATE KEY") PEM formats.
-func LoadPrivateKey(path string) (*rsa.PrivateKey, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read private key (%s): %w", path, err)
-	}
-	block, _ := pem.Decode(data)
-	if block == nil {
-		return nil, fmt.Errorf("no PEM block found in %s", path)
-	}
-	switch block.Type {
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("PKCS8 parse failed: %w", err)
-		}
-		rsaKey, ok := key.(*rsa.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("not an RSA private key: %s", path)
-		}
-		return rsaKey, nil
-	default:
-		return nil, fmt.Errorf("unsupported PEM type %q in %s", block.Type, path)
-	}
-}
-
-// FindPubKeyPath returns the path to the first *.pub file in the same directory
-// as the running executable.
+// FindPubKeyPath locates the first .pub file (alphabetical order)
+// in the executable's directory.
 func FindPubKeyPath() (string, error) {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -85,12 +58,12 @@ func FindPubKeyPath() (string, error) {
 	return matches[0], nil
 }
 
-// KeyBaseName returns the stem of the key filename (e.g. "2026q2" from "2026q2.pub").
-// This is used as the output file extension.
+// KeyBaseName returns the file stem of the public key to be used to
+// include the key identifier in the output filename.
 func KeyBaseName(keyPath string) string {
 	base := filepath.Base(keyPath)
-	// Strip known extensions: .pub, .pri, .pem
-	for _, ext := range []string{".pub", ".pri", ".pem"} {
+	// Strip known extensions: .pub, .pem
+	for _, ext := range []string{".pub", ".pem"} {
 		if strings.HasSuffix(strings.ToLower(base), ext) {
 			return base[:len(base)-len(ext)]
 		}

@@ -1,4 +1,5 @@
-// Package report generates collection result reports.
+// Package report provides functionality to generate forensic collection reports
+// in text and JSON formats.
 package report
 
 import (
@@ -14,8 +15,6 @@ import (
 	"collector/internal/config"
 )
 
-// ── Entry Result Types ────────────────────────────────────────────────────────
-
 type entryStatus int
 
 const (
@@ -25,84 +24,114 @@ const (
 	statusFailure
 )
 
-// EntryResult aggregates the collection result for one config.Entry row.
+// EntryResult represents the collection outcome for a single configuration entry.
 type EntryResult struct {
-	Entry   config.Entry
-	Status  entryStatus
-	Results []collect.CollectionResult
-	ErrMsg  string
+	Category  string
+	Target    string
+	Successes []collect.ResultSet
+	Skips     []string
+	Failures  []map[string]string // path → error message
+	Status    entryStatus
 }
 
-// ── Report ────────────────────────────────────────────────────────────────────
-
-// Report holds the results of a complete collection session.
+// Report maintains the aggregate statistics and detailed results of a collection session.
 type Report struct {
-	timestamp string
-	hostname  string
-	entries   []EntryResult
-	memDump   *memoryDumpInfo // nil = not attempted
+	starttime    time.Time
+	hostname     string
+	results      []EntryResult
+	memDump      *memoryDumpInfo // nil if not attempted
+	totalCount   int
+	successCount int
+	skipCount    int
+	failureCount int
 }
 
-// New creates a new Report for a collection session.
-func New(hostname string) *Report {
-	return &Report{hostname: hostname}
+// New initializes a new Report with the given start time and hostname.
+func New(starttime time.Time, hostname string) *Report {
+	return &Report{starttime: starttime, hostname: hostname}
 }
 
-// ── Add Methods ───────────────────────────────────────────────────────────────
-
-func (r *Report) AddSuccess(entry config.Entry, results []collect.CollectionResult) {
-	r.entries = append(r.entries, EntryResult{
-		Entry:   entry,
-		Status:  statusSuccess,
-		Results: results,
+// GenerateEntry initializes a result entry for the specified configuration item.
+func (r *Report) GenerateEntry(entry config.Entry) {
+	r.results = append(r.results, EntryResult{
+		Category: entry.Category,
+		Target:   entry.Target,
 	})
 }
 
-func (r *Report) AddPartial(entry config.Entry, results []collect.CollectionResult, errMsg string) {
-	r.entries = append(r.entries, EntryResult{
-		Entry:   entry,
-		Status:  statusPartial,
-		Results: results,
-		ErrMsg:  errMsg,
-	})
-}
-
-func (r *Report) AddSkipped(entry config.Entry) {
-	r.entries = append(r.entries, EntryResult{
-		Entry:  entry,
-		Status: statusSkipped,
-	})
-}
-
-func (r *Report) AddFailure(entry config.Entry, errMsg string) {
-	r.entries = append(r.entries, EntryResult{
-		Entry:  entry,
-		Status: statusFailure,
-		ErrMsg: errMsg,
-	})
-}
-
-// ── Aggregation ───────────────────────────────────────────────────────────────
-
-func (r *Report) totalFiles() int {
-	n := 0
-	for _, e := range r.entries {
-		n += len(e.Results)
+// AddSuccess records a successfully collected artifact and updates the status.
+func (r *Report) AddSuccess(category string, target string, result collect.ResultSet) {
+	i := r.findIndex(category, target)
+	if i < 0 {
+		return
 	}
-	return n
+	r.results[i].Successes = append(r.results[i].Successes, result)
+	r.totalCount++
+	r.successCount++
+	r.updateStatus(i)
 }
 
-func (r *Report) countByStatus(s entryStatus) int {
-	n := 0
-	for _, e := range r.entries {
-		if e.Status == s {
-			n++
+// AddSkipped records an artifact that was skipped (e.g., file not found).
+func (r *Report) AddSkipped(category string, target string, path string) {
+	i := r.findIndex(category, target)
+	if i < 0 {
+		return
+	}
+	r.results[i].Skips = append(r.results[i].Skips, path)
+	r.skipCount++
+	r.updateStatus(i)
+}
+
+// AddFailure records an artifact collection error and updates entry status.
+func (r *Report) AddFailure(category string, target string, fail map[string]error) {
+	i := r.findIndex(category, target)
+	if i < 0 {
+		return
+	}
+	// Convert map[string]error → map[string]string for JSON serialisation.
+	m := make(map[string]string, len(fail))
+	for k, v := range fail {
+		m[k] = v.Error()
+	}
+	r.results[i].Failures = append(r.results[i].Failures, m)
+	r.totalCount++
+	r.failureCount++
+	r.updateStatus(i)
+}
+
+// findIndex returns the slice index of the EntryResult matching (category, target),
+// or -1 if not found.
+func (r *Report) findIndex(category, target string) int {
+	for i := range r.results {
+		if r.results[i].Category == category && r.results[i].Target == target {
+			return i
 		}
 	}
-	return n
+	return -1
 }
 
-func totalBytes(results []collect.CollectionResult) uint64 {
+// updateStatus recalculates the Status field for results[i] from its current
+// Successes / Skips / Failures slices.
+func (r *Report) updateStatus(i int) {
+	e := &r.results[i]
+	hasSuccess := len(e.Successes) > 0
+	hasFail := len(e.Failures) > 0
+	hasSkip := len(e.Skips) > 0
+
+	switch {
+	case hasSuccess && !hasFail:
+		e.Status = statusSuccess
+	case hasSuccess && hasFail:
+		e.Status = statusPartial
+	case hasFail && !hasSuccess:
+		e.Status = statusFailure
+	case hasSkip && !hasSuccess && !hasFail:
+		e.Status = statusSkipped
+	}
+}
+
+// totalBytes calculates the total number of bytes copied.
+func totalBytes(results []collect.ResultSet) uint64 {
 	var t uint64
 	for _, r := range results {
 		t += r.BytesCopied
@@ -110,8 +139,7 @@ func totalBytes(results []collect.CollectionResult) uint64 {
 	return t
 }
 
-// ── Console Output ────────────────────────────────────────────────────────────
-
+// PrintSummary shows the result summary on the console.
 func (r *Report) PrintSummary() {
 	fmt.Println("╔══════════════════════════════════════════════════════╗")
 	fmt.Println("║               Collection Summary                     ║")
@@ -119,77 +147,58 @@ func (r *Report) PrintSummary() {
 	fmt.Printf("  Hostname       : %s\n", r.hostname)
 	if r.memDump != nil {
 		if r.memDump.success {
-			fmt.Printf("  Memory Dump    : ✓ %s (%.1f sec)\n",
+			fmt.Printf("  Memory Dump    : SUCCESS %s (%.1f sec)\n",
 				r.memDump.zipEntry, r.memDump.elapsedSec)
 		} else {
-			fmt.Printf("  Memory Dump    : ✗ failed (%s)\n", r.memDump.errMsg)
+			fmt.Printf("  Memory Dump    : FAIL (%s)\n", r.memDump.errMsg)
 		}
 	} else {
 		fmt.Printf("  Memory Dump    : - skipped\n")
 	}
-		fmt.Printf("  Entries        : %d\n", len(r.entries))
-	fmt.Printf("  Success        : %d entries (%d files)\n",
-		r.countByStatus(statusSuccess)+r.countByStatus(statusPartial), r.totalFiles())
-	if r.countByStatus(statusSkipped) > 0 {
-		fmt.Printf("  Skipped        : %d entries (no files found)\n", r.countByStatus(statusSkipped))
+	fmt.Printf("  Target         : %d entries (%d files)\n", len(r.results), r.totalCount)
+	fmt.Printf("  Success        : %d files\n", r.successCount)
+	if r.skipCount > 0 {
+		fmt.Printf("  Skipped        : %d files\n", r.skipCount)
 	}
-	if r.countByStatus(statusFailure) > 0 {
-		fmt.Printf("  Failed         : %d entries\n", r.countByStatus(statusFailure))
-	}
-	fmt.Println()
-
-	for _, e := range r.entries {
-		switch e.Status {
-		case statusSuccess:
-			fmt.Printf("  ✓ [%s] %s\n", e.Entry.Type, e.Entry.Path)
-			fmt.Printf("      %d file(s) / %s\n", len(e.Results), formatBytes(totalBytes(e.Results)))
-		case statusPartial:
-			fmt.Printf("  △ [%s] %s\n", e.Entry.Type, e.Entry.Path)
-			fmt.Printf("      %d file(s) collected (partial failure: %s)\n", len(e.Results), e.ErrMsg)
-		case statusSkipped:
-			fmt.Printf("  ~ [%s] %s — no files found\n", e.Entry.Type, e.Entry.Path)
-		case statusFailure:
-			fmt.Printf("  ✗ [%s] %s\n", e.Entry.Type, e.Entry.Path)
-			fmt.Printf("      Error: %s\n", e.ErrMsg)
-		}
+	if r.failureCount > 0 {
+		fmt.Printf("  Failed         : %d files\n", r.failureCount)
 	}
 	fmt.Println()
 }
 
-// ── Text Report ───────────────────────────────────────────────────────────────
-
+// WriteText generates the report message for the txt format report.
 func (r *Report) writeText(w io.Writer) {
 	fmt.Fprintln(w, "Artifact Collection Report")
 	fmt.Fprintln(w, "==========================")
 	fmt.Fprintf(w, "Hostname   : %s\n", r.hostname)
-		fmt.Fprintf(w, "Generated  : %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	fmt.Fprintf(w, "Entries    : %d total / %d success / %d skip / %d fail\n\n",
-		len(r.entries),
+	fmt.Fprintf(w, "Started    : %s\n", r.starttime.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(w, "Finished   : %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(w, "Targets    : %d total / %d success / %d skip / %d fail\n\n",
+		len(r.results),
 		r.countByStatus(statusSuccess)+r.countByStatus(statusPartial),
 		r.countByStatus(statusSkipped),
 		r.countByStatus(statusFailure),
 	)
 	fmt.Fprintln(w, "--------------------------")
 
-	for _, e := range r.entries {
-		recursive := "NO"
-		if e.Entry.Recursive {
-			recursive = "YES"
-		}
+	for _, e := range r.results {
 		switch e.Status {
 		case statusSuccess, statusPartial:
 			statusStr := "SUCCESS"
 			if e.Status == statusPartial {
 				statusStr = "PARTIAL"
 			}
-			fmt.Fprintf(w, "[%s] %s  %s\n", statusStr, string(e.Entry.Type), e.Entry.Path)
-			fmt.Fprintf(w, "  Path      : %s\n", e.Entry.Path)
-			fmt.Fprintf(w, "  Recursive : %s\n", recursive)
-			fmt.Fprintf(w, "  Files     : %d (%s total)\n", len(e.Results), formatBytes(totalBytes(e.Results)))
-			if e.ErrMsg != "" {
-				fmt.Fprintf(w, "  Warning   : %s\n", e.ErrMsg)
+			fmt.Fprintf(w, "[%s] [%s] %s\n", statusStr, e.Category, e.Target)
+			fmt.Fprintf(w, "  Files     : %d (%s)\n", len(e.Successes), formatBytes(totalBytes(e.Successes)))
+			if len(e.Failures) > 0 {
+				fmt.Fprintln(w, "  Warnings  :")
+				for _, m := range e.Failures {
+					for path, msg := range m {
+						fmt.Fprintf(w, "    File : %s\n      %s\n", path, msg)
+					}
+				}
 			}
-			for _, res := range e.Results {
+			for _, res := range e.Successes {
 				if res.SHA256 != "" {
 					fmt.Fprintf(w, "    - %s (%s)  %s\n",
 						filepath.Base(res.OutputPath), formatBytes(res.BytesCopied), res.SHA256)
@@ -199,17 +208,24 @@ func (r *Report) writeText(w io.Writer) {
 				}
 			}
 		case statusSkipped:
-			fmt.Fprintf(w, "[SKIPPED] %s\n", e.Entry.Type)
-			fmt.Fprintf(w, "  Path : %s\n", e.Entry.Path)
+			fmt.Fprintf(w, "[SKIPPED] [%s] %s\n", e.Category, e.Target)
+			for _, s := range e.Skips {
+				fmt.Fprintf(w, "    - %s\n", s)
+			}
 		case statusFailure:
-			fmt.Fprintf(w, "[FAILED] %s\n", e.Entry.Type)
-			fmt.Fprintf(w, "  Path  : %s\n", e.Entry.Path)
-			fmt.Fprintf(w, "  Error : %s\n", e.ErrMsg)
+			fmt.Fprintf(w, "[FAILED] [%s] %s\n", e.Category, e.Target)
+			fmt.Fprintln(w, "  Errors :")
+			for _, m := range e.Failures {
+				for path, msg := range m {
+					fmt.Fprintf(w, "    File : %s\n      %s\n", path, msg)
+				}
+			}
 		}
 		fmt.Fprintln(w)
 	}
 }
 
+// SaveText saves the txt format report file.
 func (r *Report) SaveText(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -220,14 +236,14 @@ func (r *Report) SaveText(path string) error {
 	return nil
 }
 
+// ToTextBytes converts report contents to the txt format suitable byte array.
 func (r *Report) ToTextBytes() []byte {
 	var buf bytes.Buffer
 	r.writeText(&buf)
 	return buf.Bytes()
 }
 
-// ── JSON Report ───────────────────────────────────────────────────────────────
-
+// writeJSON generates the report message for the JSON format report.
 func (r *Report) writeJSON(w io.Writer) error {
 	type fileEntry struct {
 		Name       string `json:"name"`
@@ -237,48 +253,52 @@ func (r *Report) writeJSON(w io.Writer) error {
 		SHA256     string `json:"sha256,omitempty"`
 	}
 	type entryJSON struct {
-		Type      string      `json:"type"`
-		Category  string      `json:"category,omitempty"`
-		Recursive bool        `json:"recursive"`
-		Path      string      `json:"path"`
-		Status    string      `json:"status"`
-		Files     []fileEntry `json:"files,omitempty"`
-		Error     string      `json:"error,omitempty"`
+		Category  string              `json:"category,omitempty"`
+		Target    string              `json:"path"`
+		Status    string              `json:"status"`
+		Successes []fileEntry         `json:"successes,omitempty"`
+		Skips     []string            `json:"skips,omitempty"`
+		Failures  []map[string]string `json:"errors,omitempty"`
 	}
 	type rootJSON struct {
 		Report struct {
 			Hostname   string `json:"hostname"`
-			Timestamp  string `json:"timestamp"`
+			Started    string `json:"started"`
+			Finished   string `json:"finished"`
 			Entries    int    `json:"entries"`
 			TotalFiles int    `json:"total_files"`
+			Success    int    `json:"success"`
+			Skipped    int    `json:"skipped"`
+			Failed     int    `json:"failed"`
 		} `json:"report"`
 		Artifacts []entryJSON `json:"artifacts"`
 	}
 
 	var root rootJSON
 	root.Report.Hostname = r.hostname
-	root.Report.Timestamp = r.timestamp
-	root.Report.Entries = len(r.entries)
-	root.Report.TotalFiles = r.totalFiles()
+	root.Report.Started = r.FormatTime(r.starttime)
+	root.Report.Finished = r.FormatTime(time.Now())
+	root.Report.Entries = len(r.results)
+	root.Report.TotalFiles = r.totalCount
+	root.Report.Success = r.successCount
+	root.Report.Skipped = r.skipCount
+	root.Report.Failed = r.failureCount
 
-	for _, e := range r.entries {
-		statusStr := map[entryStatus]string{
-			statusSuccess: "success",
-			statusPartial: "partial",
-			statusSkipped: "skipped",
-			statusFailure: "failed",
-		}[e.Status]
+	statusLabel := map[entryStatus]string{
+		statusSuccess: "success",
+		statusPartial: "partial",
+		statusSkipped: "skipped",
+		statusFailure: "failed",
+	}
 
+	for _, e := range r.results {
 		ej := entryJSON{
-			Type:      string(e.Entry.Type),
-			Category:  e.Entry.Category,
-			Recursive: e.Entry.Recursive,
-			Path:      e.Entry.Path,
-			Status:    statusStr,
-			Error:     e.ErrMsg,
+			Category: e.Category,
+			Target:   e.Target,
+			Status:   statusLabel[e.Status],
 		}
-		for _, res := range e.Results {
-			ej.Files = append(ej.Files, fileEntry{
+		for _, res := range e.Successes {
+			ej.Successes = append(ej.Successes, fileEntry{
 				Name:       filepath.Base(res.OutputPath),
 				Source:     res.SourcePath,
 				CryptEntry: res.OutputPath,
@@ -286,6 +306,8 @@ func (r *Report) writeJSON(w io.Writer) error {
 				SHA256:     res.SHA256,
 			})
 		}
+		ej.Skips = append(ej.Skips, e.Skips...)
+		ej.Failures = append(ej.Failures, e.Failures...)
 		root.Artifacts = append(root.Artifacts, ej)
 	}
 
@@ -294,6 +316,7 @@ func (r *Report) writeJSON(w io.Writer) error {
 	return enc.Encode(root)
 }
 
+// SaveText saves the JSON format report file.
 func (r *Report) SaveJSON(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -303,6 +326,7 @@ func (r *Report) SaveJSON(path string) error {
 	return r.writeJSON(f)
 }
 
+// ToJSONBytes converts report contents to the JSON report suitable byte array.
 func (r *Report) ToJSONBytes() ([]byte, error) {
 	var buf bytes.Buffer
 	if err := r.writeJSON(&buf); err != nil {
@@ -311,8 +335,7 @@ func (r *Report) ToJSONBytes() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
+// formatBytes converts a byte count into a human-readable string with appropriate units.
 func formatBytes(b uint64) string {
 	const (
 		KB = uint64(1024)
@@ -330,8 +353,6 @@ func formatBytes(b uint64) string {
 		return fmt.Sprintf("%d bytes", b)
 	}
 }
-
-// ── Memory Dump Recording ─────────────────────────────────────────────────────
 
 type memoryDumpInfo struct {
 	success    bool
@@ -354,4 +375,19 @@ func (r *Report) AddMemoryDumpSuccess(zipEntry string, bytes uint64, elapsedSec 
 // AddMemoryDumpSkipped records a failed or skipped memory dump.
 func (r *Report) AddMemoryDumpSkipped(errMsg string) {
 	r.memDump = &memoryDumpInfo{success: false, errMsg: errMsg}
+}
+
+func (r *Report) countByStatus(s entryStatus) int {
+	cnt := 0
+	for _, e := range r.results {
+		if e.Status == s {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+// FormatTime converts timestamp to local human readable format.
+func (r *Report) FormatTime(timestamp time.Time) string {
+	return timestamp.Local().Format("2006-01-02 15:04:05")
 }
