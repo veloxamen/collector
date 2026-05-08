@@ -43,7 +43,7 @@ func LoadPublicKey(path string) (*rsa.PublicKey, error) {
 	}
 }
 
-// FindPubKeyPath locates the first .pub file (alphabetical order)
+// FindPubKeyPath locates the first public key file (alphabetical order)
 // in the executable's directory.
 func FindPubKeyPath() (string, error) {
 	exePath, err := os.Executable()
