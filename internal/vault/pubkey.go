@@ -51,10 +51,22 @@ func FindPubKeyPath() (string, error) {
 		return "", fmt.Errorf("failed to get executable path: %w", err)
 	}
 	exeDir := filepath.Dir(exePath)
-	matches, err := filepath.Glob(filepath.Join(exeDir, "*.pub"))
-	if err != nil || len(matches) == 0 {
-		return "", fmt.Errorf("no *.pub file found in %s", exeDir)
+
+	// Search public key file in the executing directory.
+	patterns := []string{"*.pub", "*.pem"}
+	var matches []string
+	for _, p := range patterns {
+		matches, err = filepath.Glob(filepath.Join(exeDir, p))
+		// Exit the loop once a match is found.
+		if err == nil && len(matches) > 0 {
+			break
+		}
 	}
+
+	if len(matches) == 0 {
+		return "", fmt.Errorf("no .pub or .pem file found in %s", exeDir)
+	}
+
 	return matches[0], nil
 }
 
