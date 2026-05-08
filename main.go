@@ -105,7 +105,7 @@ func main() {
 		}
 		result, err := memory.AcquireAndCompress(hostname)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  ✗ Memory dump failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "  ! Memory dump failed: %v\n", err)
 			rep.AddMemoryDumpSkipped(err.Error())
 		} else {
 			if err := ew.WriteEntry("memdump.zip", result.ZipData); err != nil {
@@ -113,7 +113,7 @@ func main() {
 				rep.AddMemoryDumpSkipped("write to bundle failed: " + err.Error())
 			} else {
 				rep.AddMemoryDumpSuccess("memdump.zip", uint64(len(result.ZipData)), result.ElapsedSec)
-				fmt.Printf("  ✓ memdump.zip  raw=%.2f GB  time=%.0fs\n",
+				fmt.Printf("  SUCCESS memdump.zip  raw=%.2f GB  time=%.0fs\n",
 					float64(result.RawBytes)/float64(1<<30), result.ElapsedSec)
 			}
 		}
