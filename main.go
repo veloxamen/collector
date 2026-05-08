@@ -132,7 +132,7 @@ func main() {
 
 	// Enumerate paths based on config.
 	fmt.Println("[PREP] Enumerating files to be collected...")
-	entries, profiles, err := config.Resolve(cfg)
+	entries, profiles, err := config.Prepare(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] Failed to enumerate collection targets: %v\n", err)
 		abortAndClose()
