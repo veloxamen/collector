@@ -109,5 +109,3 @@ Use this when you need total control, such as when the system drive is not C:.
     { "category": "RecycleBin", "target": "D:\\$Recycle.Bin\\{sid}\\$I*" }
   ]
 }
-```
-Part of the [veloxamen](https://github.com/veloxamen).
