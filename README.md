@@ -52,7 +52,10 @@ openssl rsa -in private.pem -pubout -out public.pem
 ## 🚀 Usage
 
 ### Basic Execution
-Simply running the executable will collect a standard set of artifacts based on the built-in configuration.
+Simply **double-clicking** the executable will collect a standard set of artifacts based on the built-in configuration. 
+
+> [!IMPORTANT]
+> **Administrator privileges are required.** When prompted by **User Account Control (UAC)**, please click **"Yes"** to allow the tool to access critical system artifacts. No command-line arguments are required for standard triage.
 
 ### Command Line Options
 | Option | Description | Default |
@@ -66,7 +69,7 @@ Simply running the executable will collect a standard set of artifacts based on 
 
 ### Example
 ```bash
-collector.exe -config "C:\Users\john\append.json" -hash
+collector.exe -config "C:\Users\john\Desktop\append.json" -hash
 ```
 
 ## ⚙️ Configuration Samples
