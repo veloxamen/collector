@@ -110,5 +110,4 @@ Use this when you need total control, such as when the system drive is not C:.
   ]
 }
 ```
-‘‘‘
 Part of the [veloxamen](https://github.com/veloxamen).
