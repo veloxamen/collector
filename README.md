@@ -7,6 +7,7 @@
 ## ✨ Key Concepts
 
 * **Speed:** Designed for rapid triage with minimal impact on the target host.
+* * **Security:** Integrated with **Cloud KMS** for secure artifact handling. Minimizes legal and compliance risks by excluding PII (Personally Identifiable Information) during collection as much as possible.
 * **Security:** Integrated with a cloud-native pipeline using **Cloud KMS** for secure artifact handling.
 * **Simplicity:** A single-binary approach—no installation required.
 
@@ -84,7 +85,7 @@ Use this to add specific targets while keeping the built-in collection rules.
     { "category": "Activity", "target": "C:\\Windows\\System32\\sru\\SRUDB.dat" }
   ],
   "dynamic_entries": [
-    { "category": "Activity", "target": "C:\\Windows\\Temp*" }
+    { "category": "Activity", "target": "C:\\Windows\\Temp\\*" }
   ],
   "profile_entries": [
     { "category": "Web", "target": "{profile_path}\\AppData\\Local\\Google\\Chrome\\User Data\\*\\Cache\\Cache_Data\\*" }
@@ -102,7 +103,7 @@ Use this when you need total control, such as when the system drive is not C:.
     { "category": "Network", "target": "D:\\Windows\\System32\\drivers\\etc\\hosts" }
   ],
   "dynamic_entries": [
-    { "category": "EventLog", "target": "D:\\Windows\\System32\\winevt\\Logs*" },
+    { "category": "EventLog", "target": "D:\\Windows\\System32\\winevt\\Logs\\*" },
     { "category": "Registry", "target": "D:\\Windows\\System32\\config\\SYSTEM*" }
   ],
   "profile_entries": [
