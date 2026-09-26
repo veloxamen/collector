@@ -1,0 +1,13 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Forensic Upload Tool State & Generated Files
+.last_uploader_sa*
+*.ps1
+
+# Executables /  (if any)
+*.exe
+*.zip
