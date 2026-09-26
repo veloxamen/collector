@@ -1,10 +1,25 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package collect gathers Windows artifacts and writes them to an encrypted stream.
 package collect
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,6 +31,7 @@ import (
 // EntryWriter is the interface that wraps the basic WriteEntry and Close methods.
 type EntryWriter interface {
 	WriteEntry(name string, data []byte) error
+	WriteEntryStream(name string, size uint64, r io.Reader) error
 	Close() error
 }
 
@@ -72,16 +88,75 @@ func (c *Collect) ReadAndEncrypt(path string) (ResultSet, error) {
 		}
 		return ResultSet{}, fmt.Errorf("cannot resolve inode for %s", relPath)
 	}
-	data, err := sess.ReadFileByInode(inode)
-	if err != nil {
-		return ResultSet{}, fmt.Errorf("inode read failed (%s): %w", relPath, err)
-	}
+
 	ts, hasTS := sess.GetFileTimestampsByInode(inode)
 	var modTime time.Time
 	if hasTS {
 		modTime = ts.Modified
 	}
+
+	// Files exceeding the threshold are streamed instead of buffered.
+	if threshold := ntfs.StreamThresholdBytes(); threshold > 0 {
+		if size, sizeErr := sess.GetFileSizeByInode(inode); sizeErr == nil && size > threshold {
+			return c.streamAndEncrypt(sess, path, inode, size, modTime)
+		}
+	}
+
+	data, err := sess.ReadFileByInode(inode)
+	if err != nil {
+		return ResultSet{}, fmt.Errorf("inode read failed (%s): %w", relPath, err)
+	}
 	return c.encryptData(path, data, modTime)
+}
+
+// streamAndEncrypt streams and encrypts large files without buffering them in memory.
+func (c *Collect) streamAndEncrypt(sess *ntfs.Session, sourcePath string, inode uint64, size uint64, modTime time.Time) (ResultSet, error) {
+	entryName := pathToCryptEntry(sourcePath)
+	pr, pw := io.Pipe()
+
+	readErr := make(chan error, 1)
+	go func() {
+		n, err := sess.StreamFileByInode(inode, pw)
+		if err == nil && n != size {
+			err = fmt.Errorf("read %d bytes from volume but expected %d", n, size)
+		}
+		// CloseWithError closes the reader with an optional error, preserving the cause.
+		pw.CloseWithError(err)
+		readErr <- err
+	}()
+
+	var r io.Reader = pr
+	var hasher *hash.StreamHasher
+	if c.doHash {
+		hasher = hash.NewStreamHasher()
+		r = io.TeeReader(pr, hasher)
+	}
+
+	writeErr := c.enc.WriteEntryStream(entryName, size, r)
+	if writeErr != nil {
+		// Unblock the producer to prevent goroutine leaks.
+		pr.CloseWithError(writeErr)
+	}
+
+	// Drain the reader to prevent leaks and prioritize its error.
+	if re := <-readErr; re != nil && writeErr == nil {
+		writeErr = fmt.Errorf("read from volume: %w", re)
+	}
+	if writeErr != nil {
+		return ResultSet{}, fmt.Errorf("stream write failed (%s): %w", sourcePath, writeErr)
+	}
+
+	result := ResultSet{
+		OutputPath:  entryName,
+		BytesCopied: size,
+		SourcePath:  sourcePath,
+		Modified:    modTime,
+		Method:      "stream",
+	}
+	if hasher != nil {
+		result.SHA256 = hasher.SumHex()
+	}
+	return result, nil
 }
 
 // encryptData handles the encryption of raw data and optional SHA-256 hashing.

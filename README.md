@@ -1,32 +1,37 @@
-# 🛠️ collector
+# 📦 collector
 
 **High-Speed Windows Artifact Collection Tool for Cloud-Native DFIR**
 
-`collector` is a lightweight, standalone tool written in **Go**, designed to collect critical Windows artifacts for incident response. It serves as the primary entry point for the **[veloxamen](https://github.com/veloxamen)** forensic pipeline.
+`collector` is a lightweight, standalone tool written in **Go**, designed to collect critical Windows artifacts for incident response. It serves as the primary entry point for the **[veloxamen](https://www.google.com/search?q=https://github.com/veloxamen)** forensic pipeline.
 
 ## ✨ Key Concepts
 
 * **Speed:** Designed for rapid triage with minimal impact on the target host.
-* * **Security:** Integrated with **Cloud KMS** for secure artifact handling. Minimizes legal and compliance risks by excluding PII (Personally Identifiable Information) during collection as much as possible.
-* **Security:** Integrated with a cloud-native pipeline using **Cloud KMS** for secure artifact handling.
+* **Security:** Integrated with a cloud-native pipeline using **Cloud KMS** and RSA encryption for secure artifact handling. Minimizes legal and compliance risks by excluding PII (Personally Identifiable Information) where possible.
 * **Simplicity:** A single-binary approach—no installation required.
 
 ---
 
 ## 🔑 Key Preparation (Security)
 
-To execute the collector, a **4096-bit RSA PKIX public key** must be delivered in the same directory as the executable.
+To execute the collector, a **4096-bit RSA PKIX public key** must be placed in the same directory as the executable.
 
-* **Recommended Name:** `yyqx.pub` (e.g., `26q2.pub` for the 2nd quarter of 2026).
-* **Note:** The filename extension will be utilized as the identifier for the collected data.
+* **Note:** The filename extension (excluding `.pub`) determines the file extension used for the collected encrypted data, so using an identifiable naming convention such as a case number (`for26001`) or a periodic identifier (`26q1`) is recommended.
 
 ### 🛠️ How to Generate Keys
 
-#### A. GUI Tool (Windows)
-You can use the [RSAKeyGenerator](https://github.com/crabcanneryship/RSAKeyGenerator).
-* Rename the generated keys to: `yyqx.pri` (Private) and `yyqx.pub` (Public).
+#### A. Via the Veloxamen Pipeline (Recommended)
 
-#### B. PowerShell
+When using `deploy.sh`, the key ring and key set are generated automatically. Once you upload the resulting encrypted bundle to the ingestion bucket, it is automatically decrypted by the pipeline and ingested into BigQuery.
+
+#### B. Manual Generation (GUI Tool - Windows)
+
+You can use [RSAKeyGenerator](https://github.com/crabcanneryship/RSAKeyGenerator).
+
+* Rename the generated keys to: `<name>.pri` (Private) and `<name>.pub` (Public).
+
+#### C. Manual Generation (PowerShell)
+
 ```powershell
 $rsa = [System.Security.Cryptography.RSA]::Create(4096)
 
@@ -39,44 +44,53 @@ $privB64 = [Convert]::ToBase64String($privBytes)
 $pubBytes = $rsa.ExportSubjectPublicKeyInfo()
 $pubB64 = [Convert]::ToBase64String($pubBytes)
 "-----BEGIN PUBLIC KEY-----`n" + ($pubB64 -replace '.{64}', "$&`n") + "`n-----END PUBLIC KEY-----" | Out-File public.pem -Encoding ascii
+
 ```
 
-#### C. Bash (OpenSSL)
-```Bash
-# Generate Secret Key
+#### D. Manual Generation (Bash / OpenSSL)
+
+```bash
+# Generate Private Key
 openssl genrsa -out private.pem 4096
 
 # Extract Public Key
 openssl rsa -in private.pem -pubout -out public.pem
+
 ```
 
-## 🚀 Usage
+## 💻 Usage
 
 ### Basic Execution
-Simply **double-clicking** the executable will collect a standard set of artifacts based on the built-in configuration. 
 
 > [!IMPORTANT]
-> **Administrator privileges are required.** When prompted by **User Account Control (UAC)**, please click **"Yes"** to allow the tool to access critical system artifacts. No command-line arguments are required for standard triage.
+> **Administrator privileges are required.** Please run `run.bat` included in this repository or execute the tool from an Administrator command prompt. No command-line arguments are required for standard triage.
 
 ### Command Line Options
+
 | Option | Description | Default |
-| :--- | :--- | :--- |
+| --- | --- | --- |
 | `-mem` | Acquire physical memory dump before artifact collection | `false` |
 | `-config` | Path to artifact definition JSON | `built-in` |
 | `-output` | Output directory | `current directory` |
 | `-hash` | Compute SHA-256 hashes for all collected files | `false` |
 | `-json-report` | Generate a detailed JSON report | `false` |
 | `-verbose` | Enable verbose logging (debug mode) | `false` |
+| `-max-file-size-mb` | Skip any single collected file above this size in MB | `1024` |
+| `-usnjrnl` | Also collect `$UsnJrnl` (NTFS USN change journal) | `false` |
 
 ### Example
+
 ```bash
 collector.exe -config "C:\Users\john\Desktop\append.json" -hash
+
 ```
 
 ## ⚙️ Configuration Samples
 
 ### 1. Appending to Defaults (`append.json`)
+
 Use this to add specific targets while keeping the built-in collection rules.
+
 ```json
 {
   "override": false,
@@ -91,10 +105,13 @@ Use this to add specific targets while keeping the built-in collection rules.
     { "category": "Web", "target": "{profile_path}\\AppData\\Local\\Google\\Chrome\\User Data\\*\\Cache\\Cache_Data\\*" }
   ]
 }
+
 ```
 
-### 2. Overriding Defaults (overwrite.config)
+### 2. Overriding Defaults (`overwrite.config`)
+
 Use this when you need total control, such as when the system drive is not C:.
+
 ```json
 {
   "override": true,
@@ -110,3 +127,5 @@ Use this when you need total control, such as when the system drive is not C:.
     { "category": "RecycleBin", "target": "D:\\$Recycle.Bin\\{sid}\\$I*" }
   ]
 }
+
+```

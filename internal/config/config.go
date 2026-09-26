@@ -1,5 +1,19 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package config provides functionality to load and resolve artifact collection paths.
 package config
 
@@ -56,13 +70,17 @@ type UserConfig struct {
 	ProfileEntries []BaseEntry `json:"profile_entries"`
 }
 
+// UsnJrnlEntry is an opt-in $UsnJrnl collection target (see -usnjrnl).
+// Because its reported size reflects its configured maximum (often tens of GB),
+// collection is slow even when streamed, and dedicated imaging tools may be preferred.
+var UsnJrnlEntry = BaseEntry{Category: "Filesystem", Target: `C:\$Extend\$UsnJrnl`}
+
 // New returns a Config populated with default artifact definitions.
 func New() *Config {
 	return &Config{
 		// StaticEntries defines paths that are absolute and do not contain wildcards (e.g., $MFT).
 		StaticEntries: []BaseEntry{
 			{Category: "Filesystem", Target: `C:\$MFT`},
-			{Category: "Filesystem", Target: `C:\$Extend\$UsnJrnl`},
 			{Category: "Network", Target: `C:\Windows\System32\drivers\etc\hosts`},
 		},
 		// DynamicEntries defines system-wide paths that require wildcard expansion (e.g., Event Logs).

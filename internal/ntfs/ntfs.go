@@ -1,11 +1,26 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package ntfs provides direct access to NTFS volume data by parsing raw structures.
 package ntfs
 
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -15,6 +30,15 @@ import (
 
 	"golang.org/x/sys/windows"
 )
+
+// maxArtifactBytes is the default safety cap (1 GiB) on single-file collection size
+// before streaming is enforced. Pass 0 to disable.
+var maxArtifactBytes uint64 = 1 << 30
+
+// SetMaxArtifactBytes overrides the default single-file size safety cap.
+func SetMaxArtifactBytes(n uint64) {
+	maxArtifactBytes = n
+}
 
 const (
 	fileFlagNoBuffering = 0x20000000
@@ -169,6 +193,94 @@ func (v *VolumeHandle) readRaw(offset, length uint64) ([]byte, error) {
 	return result, nil
 }
 
+// readRuns reads and concatenates a set of data runs from the volume,
+// capping the result at realSize bytes if specified.
+// If realSize is 0, all runs are read in full.
+func (v *VolumeHandle) readRuns(runs []dataRun, realSize uint64) ([]byte, error) {
+	var out []byte
+	if realSize > 0 {
+		out = make([]byte, 0, realSize)
+	}
+	for _, run := range runs {
+		offset := run.LCN * v.bytesPerCluster
+		length := run.Clusters * v.bytesPerCluster
+		chunk, err := v.readRaw(offset, length)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, chunk...)
+		if realSize > 0 && uint64(len(out)) >= realSize {
+			break
+		}
+	}
+	if realSize > 0 && uint64(len(out)) > realSize {
+		out = out[:realSize]
+	}
+	return out, nil
+}
+
+// readRawStream reads [offset, offset+length) in bounded-size pieces,
+// invoking fn once per piece in order. It's a thin wrapper around the
+// existing readRaw — the sector-alignment/pooling logic there is reused
+// completely unmodified; this only bounds how much of a single (possibly
+// huge, e.g. multi-GB) data run is ever materialized at once, so that
+// streaming a large file doesn't just recreate the same one-shot giant
+// allocation one level up.
+func (v *VolumeHandle) readRawStream(offset, length uint64, fn func([]byte) error) error {
+	// 32 MiB per piece. FILE_FLAG_NO_BUFFERING means every read is a real
+	// synchronous disk I/O with no OS cache behind it, so fewer/larger reads
+	// meaningfully improve throughput on SSDs vs. more numerous small ones.
+	// This is still trivial memory-wise (tens of MB) compared to the
+	// multi-GB one-shot allocations this streaming path exists to avoid.
+	const streamChunk = 32 << 20
+	for length > 0 {
+		n := length
+		if n > streamChunk {
+			n = streamChunk
+		}
+		piece, err := v.readRaw(offset, n)
+		if err != nil {
+			return err
+		}
+		if err := fn(piece); err != nil {
+			return err
+		}
+		offset += n
+		length -= n
+	}
+	return nil
+}
+
+// readRunsToWriter streams data runs to w piece by piece,
+// capping output at realSize bytes when specified.
+func (v *VolumeHandle) readRunsToWriter(runs []dataRun, realSize uint64, w io.Writer) (uint64, error) {
+	var written uint64
+	for _, run := range runs {
+		if realSize > 0 && written >= realSize {
+			break
+		}
+		offset := run.LCN * v.bytesPerCluster
+		length := run.Clusters * v.bytesPerCluster
+		err := v.readRawStream(offset, length, func(piece []byte) error {
+			if realSize > 0 {
+				if written >= realSize {
+					return nil // already satisfied; ignore any trailing padding in this run
+				}
+				if remaining := realSize - written; uint64(len(piece)) > remaining {
+					piece = piece[:remaining]
+				}
+			}
+			n, werr := w.Write(piece)
+			written += uint64(n)
+			return werr
+		})
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
+}
+
 // readFileRecord retrieves the MFT file record for the specified inode number.
 func (v *VolumeHandle) readFileRecord(inode uint64) ([]byte, error) {
 	mftOffset := v.mftStartLCN * v.bytesPerCluster
@@ -192,25 +304,23 @@ func (v *VolumeHandle) readMFTData() ([]byte, error) {
 	}
 
 	realSize := getNonResidentDataSize(record)
-	var out []byte
-	for _, run := range runs {
-		offset := run.LCN * v.bytesPerCluster
-		length := run.Clusters * v.bytesPerCluster
-		chunk, err := v.readRaw(offset, length)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, chunk...)
-		if realSize > 0 && uint64(len(out)) >= realSize {
-			break
-		}
-	}
-	if realSize > 0 && uint64(len(out)) > realSize {
-		out = out[:realSize]
+	out, err := v.readRuns(runs, realSize)
+	if err != nil {
+		return nil, err
 	}
 	// Apply USA fixup to each MFT record
 	applyUSAFixupToMFT(out, v.bytesPerFileRecord)
 	return out, nil
+}
+
+// BytesPerFileRecord returns the size of one MFT record in bytes.
+func (v *VolumeHandle) BytesPerFileRecord() uint64 {
+	return v.bytesPerFileRecord
+}
+
+// ReadMFT returns the entire MFT as a byte slice.
+func (v *VolumeHandle) ReadMFT() ([]byte, error) {
+	return v.readMFTData()
 }
 
 // applyUSAFixupToMFT iterates through MFT data and applies Update Sequence Array fixups to each valid record.
@@ -227,32 +337,6 @@ func applyUSAFixupToMFT(mftData []byte, recordSize uint64) {
 			applyUSAFixup(record) // in-place: modifies mftData slice directly
 		}
 	}
-}
-
-// readFileData retrieves file data from the disk.
-func (v *VolumeHandle) readFileData(record []byte) ([]byte, error) {
-	runs, err := parseDataRuns(record, v.bytesPerFileRecord)
-	if err == nil && len(runs) > 0 {
-		realSize := getNonResidentDataSize(record)
-		var out []byte
-		for _, run := range runs {
-			offset := run.LCN * v.bytesPerCluster
-			length := run.Clusters * v.bytesPerCluster
-			chunk, err := v.readRaw(offset, length)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, chunk...)
-			if realSize > 0 && uint64(len(out)) >= realSize {
-				break
-			}
-		}
-		if realSize > 0 && uint64(len(out)) > realSize {
-			out = out[:realSize]
-		}
-		return out, nil
-	}
-	return getResidentData(record)
 }
 
 type dataRun struct {
@@ -295,6 +379,22 @@ func applyUSAFixup(record []byte) bool {
 // isValidFileRecord checks if the file record has the valid signature.
 func isValidFileRecord(record []byte) bool {
 	return len(record) >= 4 && string(record[0:4]) == "FILE"
+}
+
+// recordAt returns the raw MFT record slice at index i, or ok=false
+// if out of bounds or invalid. This is the single low-level indexing
+// point for the in-memory MFT buffer.
+func recordAt(mftData []byte, i, recordSize uint64) (record []byte, ok bool) {
+	start := i * recordSize
+	end := start + recordSize
+	if end > uint64(len(mftData)) {
+		return nil, false
+	}
+	record = mftData[start:end]
+	if !isValidFileRecord(record) || len(record) < 0x30 {
+		return nil, false
+	}
+	return record, true
 }
 
 // collectDataRuns aggregates all $DATA data runs, accounting for both resident attributes and attribute lists.
@@ -356,19 +456,9 @@ func (s *Session) scanAttrList(data []byte) ([]dataRun, uint64, error) {
 	return allRuns, foundSize, nil
 }
 
-// readRunsRaw reads and concatenates data runs directly from the volume.
+// readRunsRaw reads and concatenates data runs directly from the volume (no size cap).
 func (s *Session) readRunsRaw(runs []dataRun) ([]byte, error) {
-	var out []byte
-	for _, run := range runs {
-		offset := run.LCN * s.handle.bytesPerCluster
-		length := run.Clusters * s.handle.bytesPerCluster
-		chunk, err := s.handle.readRaw(offset, length)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, chunk...)
-	}
-	return out, nil
+	return s.handle.readRuns(runs, 0)
 }
 
 // findAttributeListRuns returns $ATTRIBUTE_LIST (0x20) data runs from an MFT record.
@@ -434,27 +524,17 @@ func getAttributeListData(record []byte) []byte {
 
 // getRecordByInode returns an MFT record from the cache by actual inode number.
 func getRecordByInode(mftData []byte, inode uint64, recordSize uint64) []byte {
-	// fast path
-	start := inode * recordSize
-	end := start + recordSize
-	if end <= uint64(len(mftData)) {
-		record := mftData[start:end]
-		if isValidFileRecord(record) && len(record) >= 0x30 {
-			if uint64(binary.LittleEndian.Uint32(record[0x2C:0x30])) == inode {
-				return record
-			}
+	// fast path: record index == inode number, true for the vast majority of files.
+	if record, ok := recordAt(mftData, inode, recordSize); ok {
+		if uint64(binary.LittleEndian.Uint32(record[0x2C:0x30])) == inode {
+			return record
 		}
 	}
-	// linear scan
+	// slow path: fast path missed (e.g. relocated/extension record) — linear scan.
 	total := uint64(len(mftData)) / recordSize
 	for i := uint64(0); i < total; i++ {
-		s := i * recordSize
-		e := s + recordSize
-		if e > uint64(len(mftData)) {
-			break
-		}
-		record := mftData[s:e]
-		if !isValidFileRecord(record) || len(record) < 0x30 {
+		record, ok := recordAt(mftData, i, recordSize)
+		if !ok {
 			continue
 		}
 		if uint64(binary.LittleEndian.Uint32(record[0x2C:0x30])) == inode {
@@ -584,11 +664,8 @@ func getResidentData(record []byte) ([]byte, error) {
 		}
 		pos += attrLen
 	}
-	// $DATA attribute not found as a resident attribute.
-	// Active transaction log files (e.g. SYSTEM.LOG1/LOG2) can have a
-	// $DATA attribute that is empty or sparse while locked by the kernel.
-	// Return an empty slice so the caller stores a zero-byte entry instead
-	// of treating this as a collection failure.
+
+	// Return an empty slice for locked active logs rather than treating as a failure.
 	return []byte{}, nil
 }
 
@@ -643,11 +720,8 @@ func (s *Session) resolvePathInode(relPath string) (uint64, error) {
 	return parentInode, nil
 }
 
-// resolvePathInodeWithFallback はまず childMap でパスを解決し、失敗した場合は
-// MFT を全件スキャンしてファイル名の完全一致 → buildFullPath でフルパス照合する。
-//
-// $Recycle.Bin 配下のファイルのように、MFT の $FILE_NAME が指す親 inode が
-// ファイルシステム API（filepath.Glob）の結果と乖離している場合に使用する。
+// resolvePathInodeWithFallback resolves a path using childMap first, falling back
+// to a full MFT scan with full-path verification if needed.
 func (s *Session) resolvePathInodeWithFallback(relPath string) (uint64, error) {
 	inode, err := s.resolvePathInode(relPath)
 	if err == nil {
@@ -664,25 +738,20 @@ func (s *Session) resolvePathInodeWithFallback(relPath string) (uint64, error) {
 
 	total := uint64(len(s.mftData)) / s.recordSize
 	for i := uint64(0); i < total; i++ {
-		start := i * s.recordSize
-		end := start + s.recordSize
-		if end > uint64(len(s.mftData)) {
-			break
-		}
-		record := s.mftData[start:end]
-		if !isValidFileRecord(record) || len(record) < 0x30 {
+		record, ok := recordAt(s.mftData, i, s.recordSize)
+		if !ok {
 			continue
 		}
 		flags := binary.LittleEndian.Uint16(record[0x16:0x18])
 		if flags&0x01 == 0 {
 			continue
 		}
-		_, fname, ok := extractBestFileName(record)
-		if !ok || strings.ToLower(fname) != targetName {
+		_, fname, nameOK := extractBestFileName(record)
+		if !nameOK || strings.ToLower(fname) != targetName {
 			continue
 		}
-		fullPath, ok := s.buildFullPath(i)
-		if ok && strings.EqualFold(fullPath, relPath) {
+		fullPath, pathOK := s.buildFullPath(i)
+		if pathOK && strings.EqualFold(fullPath, relPath) {
 			return i, nil
 		}
 	}
@@ -791,13 +860,8 @@ func (s *Session) buildFullPath(inode uint64) (string, bool) {
 		if current == 5 { // NTFS root
 			break
 		}
-		start := current * s.recordSize
-		end := start + s.recordSize
-		if end > uint64(len(s.mftData)) {
-			return "", false
-		}
-		record := s.mftData[start:end]
-		if !isValidFileRecord(record) {
+		record, ok := recordAt(s.mftData, current, s.recordSize)
+		if !ok {
 			return "", false
 		}
 		parentInode, fname, ok := s.extractBestFileNameWithAttrList(record)
@@ -813,66 +877,6 @@ func (s *Session) buildFullPath(inode uint64) (string, bool) {
 	return strings.Join(parts, `\`), true
 }
 
-// checkFileNameAttr checks $FILE_NAME attributes (0x30) against parent inode and filename.
-func checkFileNameAttr(record []byte, parentInode uint64, name string) bool {
-	if len(record) < 0x18 {
-		return false
-	}
-	attrsOffset := int(binary.LittleEndian.Uint16(record[0x14:0x16]))
-	pos := attrsOffset
-
-	for pos+8 <= len(record) {
-		attrType := binary.LittleEndian.Uint32(record[pos : pos+4])
-		if attrType == 0xFFFFFFFF {
-			break
-		}
-		attrLen := int(binary.LittleEndian.Uint32(record[pos+4 : pos+8]))
-		if attrLen == 0 || pos+attrLen > len(record) {
-			break
-		}
-
-		if attrType == 0x30 { // $FILE_NAME
-			// Check all $FILE_NAME attributes; return true immediately on any match
-			if matchFileNameAttr(record, pos, parentInode, name) {
-				return true
-			}
-		}
-		pos += attrLen
-	}
-	return false
-}
-
-// matchFileNameAttr checks a single $FILE_NAME attribute starting at pos.
-func matchFileNameAttr(record []byte, pos int, parentInode uint64, name string) bool {
-	if pos+0x16 > len(record) {
-		return false
-	}
-	contentOffset := int(binary.LittleEndian.Uint16(record[pos+0x14 : pos+0x16]))
-	cs := pos + contentOffset
-
-	if cs+0x42 > len(record) {
-		return false
-	}
-
-	parRef := binary.LittleEndian.Uint64(record[cs : cs+8])
-	par := parRef & 0x0000FFFFFFFFFFFF
-
-	nameLen := int(record[cs+0x40])
-	nameStart := cs + 0x42
-	nameEnd := nameStart + nameLen*2
-	if nameEnd > len(record) {
-		return false
-	}
-
-	utf16 := make([]uint16, nameLen)
-	for i := range utf16 {
-		utf16[i] = binary.LittleEndian.Uint16(record[nameStart+i*2:])
-	}
-	fname := windows.UTF16ToString(utf16)
-
-	return par == parentInode && strings.EqualFold(fname, name)
-}
-
 // splitPath converts a path string to a slice of path items.
 func splitPath(p string) []string {
 	var parts []string
@@ -884,171 +888,6 @@ func splitPath(p string) []string {
 		}
 	}
 	return parts
-}
-
-// MatchEntry represents a file or directory matched during MFT scanning.
-type MatchEntry struct {
-	Name  string
-	Inode uint64
-}
-
-// BytesPerFileRecord returns the size of one MFT record in bytes.
-func (v *VolumeHandle) BytesPerFileRecord() uint64 {
-	return v.bytesPerFileRecord
-}
-
-// ReadMFT returns the entire MFT as a byte slice.
-func (v *VolumeHandle) ReadMFT() ([]byte, error) {
-	return v.readMFTData()
-}
-
-// ChildrenMatchingFiles returns files under parentInode matching pattern using the childMap.
-func (s *Session) ChildrenMatchingFiles(parentInode uint64, pattern string) []MatchEntry {
-	return s.childrenMatchingFromMap(parentInode, pattern, false)
-}
-
-// ChildrenMatchingDirs returns directories under parentInode matching pattern using the childMap.
-func (s *Session) ChildrenMatchingDirs(parentInode uint64, pattern string) []MatchEntry {
-	return s.childrenMatchingFromMap(parentInode, pattern, true)
-}
-
-// childrenMatchingFromMap is the childMap-backed implementation.
-func (s *Session) childrenMatchingFromMap(parentInode uint64, pattern string, dirsOnly bool) []MatchEntry {
-	var found []MatchEntry
-	for _, e := range s.childMap[parentInode] {
-		if dirsOnly && !e.isDir {
-			continue
-		}
-		if !dirsOnly && e.isDir {
-			continue
-		}
-		if wildcardMatch(pattern, e.name) {
-			found = append(found, MatchEntry{Name: e.name, Inode: e.inode})
-		}
-	}
-	return found
-}
-
-// wildcardMatch performs a case-insensitive, shell-style wildcard match supporting '*' and '?'.
-func wildcardMatch(pattern, name string) bool {
-	p := []rune(strings.ToLower(pattern))
-	n := []rune(strings.ToLower(name))
-	np, nn := len(p), len(n)
-
-	// row[j] = true means p[:i] matches n[:j] for the current pattern index i.
-	row := make([]bool, nn+1)
-	nxt := make([]bool, nn+1)
-
-	row[0] = true // empty pattern matches empty name
-	for i := 1; i <= np; i++ {
-		for j := range nxt {
-			nxt[j] = false
-		}
-		// nxt[0]: only '*' (matching zero chars) can extend a match to empty name.
-		if p[i-1] == '*' {
-			nxt[0] = row[0]
-		}
-		for j := 1; j <= nn; j++ {
-			switch p[i-1] {
-			case '*':
-				// Either consume one name char (nxt[j-1]) or skip the '*' (row[j]).
-				nxt[j] = nxt[j-1] || row[j]
-			case '?':
-				nxt[j] = row[j-1]
-			default:
-				nxt[j] = row[j-1] && p[i-1] == n[j-1]
-			}
-		}
-		row, nxt = nxt, row
-	}
-	return row[nn]
-}
-
-// getFileNameIfParent retrieves the Win32-preferred filename for a record
-// if it belongs to the specified parent inode.
-func getFileNameIfParent(record []byte, parentInode uint64) string {
-	if len(record) < 0x18 {
-		return ""
-	}
-	attrsOffset := int(binary.LittleEndian.Uint16(record[0x14:0x16]))
-	pos := attrsOffset
-
-	type candidate struct {
-		ns   uint8
-		name string
-	}
-	var best *candidate
-
-	for pos+8 <= len(record) {
-		attrType := binary.LittleEndian.Uint32(record[pos : pos+4])
-		if attrType == 0xFFFFFFFF {
-			break
-		}
-		attrLen := int(binary.LittleEndian.Uint32(record[pos+4 : pos+8]))
-		if attrLen == 0 || pos+attrLen > len(record) {
-			break
-		}
-
-		if attrType == 0x30 {
-			if pos+0x16 > len(record) {
-				pos += attrLen
-				continue
-			}
-			contentOffset := int(binary.LittleEndian.Uint16(record[pos+0x14 : pos+0x16]))
-			cs := pos + contentOffset
-
-			if cs+0x42 > len(record) {
-				pos += attrLen
-				continue
-			}
-
-			parRef := binary.LittleEndian.Uint64(record[cs : cs+8])
-			par := parRef & 0x0000FFFFFFFFFFFF
-
-			if par != parentInode {
-				pos += attrLen
-				continue
-			}
-
-			nameLen := int(record[cs+0x40])
-			ns := record[cs+0x41] // 0=POSIX 1=Win32 2=DOS 3=Win32&DOS
-			nameStart := cs + 0x42
-			nameEnd := nameStart + nameLen*2
-			if nameEnd > len(record) {
-				pos += attrLen
-				continue
-			}
-
-			utf16 := make([]uint16, nameLen)
-			for i := range utf16 {
-				utf16[i] = binary.LittleEndian.Uint16(record[nameStart+i*2:])
-			}
-			fname := windows.UTF16ToString(utf16)
-
-			rank := func(n uint8) int {
-				if n == 1 || n == 3 {
-					return 2
-				} else if n == 2 {
-					return 1
-				}
-				return 0
-			}
-			if best == nil || rank(ns) > rank(best.ns) {
-				best = &candidate{ns: ns, name: fname}
-			}
-		}
-		pos += attrLen
-	}
-	if best == nil {
-		return ""
-	}
-	return best.name
-}
-
-// FileEntry holds information about one file found during MFT scanning.
-type FileEntry struct {
-	RelPath string // volume-relative path (e.g. "Windows\System32\config\SYSTEM")
-	Inode   uint64
 }
 
 // childEntry is one entry in the childMap index.
@@ -1097,14 +936,8 @@ func buildChildMap(mftData []byte, recordSize uint64) map[uint64][]childEntry {
 	cm := make(map[uint64][]childEntry, totalRecords/4)
 
 	for i := uint64(0); i < totalRecords; i++ {
-		start := i * recordSize
-		end := start + recordSize
-		if end > uint64(len(mftData)) {
-			break
-		}
-		record := mftData[start:end]
-
-		if !isValidFileRecord(record) || len(record) < 0x30 {
+		record, ok := recordAt(mftData, i, recordSize)
+		if !ok {
 			continue
 		}
 		flags := binary.LittleEndian.Uint16(record[0x16:0x18])
@@ -1212,61 +1045,6 @@ func (s *Session) Close() {
 	s.handle.Close()
 }
 
-// ListDirEntries returns a list of FileEntry items under dirRelPath from the MFT.
-func (s *Session) ListDirEntries(dirRelPath string, recursive bool) ([]FileEntry, error) {
-	var dirInode uint64
-	if dirRelPath == "" {
-		dirInode = 5
-	} else {
-		var err error
-		dirInode, err = s.resolvePathInode(dirRelPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve directory inode (%s): %w", dirRelPath, err)
-		}
-	}
-	var results []FileEntry
-	s.listEntriesRecursive(dirInode, dirRelPath, recursive, &results)
-	return results, nil
-}
-
-// listEntriesRecursive searches for child entries recursively.
-func (s *Session) listEntriesRecursive(dirInode uint64, dirRelPath string, recursive bool, out *[]FileEntry) {
-	// childMap lookup: O(children of dirInode) instead of O(entire MFT).
-	for _, e := range s.childMap[dirInode] {
-		relPath := joinSessionPath(dirRelPath, e.name)
-		if e.isDir {
-			if recursive {
-				s.listEntriesRecursive(e.inode, relPath, true, out)
-			}
-		} else {
-			*out = append(*out, FileEntry{RelPath: relPath, Inode: e.inode})
-		}
-	}
-}
-
-// ListUserDirs returns subdirectory names and inodes directly under the Users directory.
-func (s *Session) ListUserDirs(usersRelPath string) ([]FileEntry, error) {
-	var dirInode uint64
-	if usersRelPath == "" {
-		dirInode = 5
-	} else {
-		var err error
-		dirInode, err = s.resolvePathInode(usersRelPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve Users directory: %w", err)
-		}
-	}
-	// Use childMap: only iterate children of dirInode, not the entire MFT.
-	var dirs []FileEntry
-	for _, e := range s.childMap[dirInode] {
-		if !e.isDir {
-			continue
-		}
-		dirs = append(dirs, FileEntry{RelPath: e.name, Inode: e.inode})
-	}
-	return dirs, nil
-}
-
 // ReadFileByInode reads file data by inode number using the MFT cache.
 func (s *Session) ReadFileByInode(inode uint64) ([]byte, error) {
 	record := getRecordByInode(s.mftData, inode, s.recordSize)
@@ -1283,30 +1061,53 @@ func (s *Session) readFileDataWithAttrList(record []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(runs) > 0 {
-		// Pre-allocate with the known real size to avoid repeated append growth.
-		var out []byte
-		if realSize > 0 {
-			out = make([]byte, 0, realSize)
-		}
-		for _, run := range runs {
-			offset := run.LCN * s.handle.bytesPerCluster
-			length := run.Clusters * s.handle.bytesPerCluster
-			chunk, err := s.handle.readRaw(offset, length)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, chunk...)
-			if realSize > 0 && uint64(len(out)) >= realSize {
-				break
-			}
-		}
-		if realSize > 0 && uint64(len(out)) > realSize {
-			out = out[:realSize]
-		}
-		return out, nil
+		return s.handle.readRuns(runs, realSize)
 	}
 	// resident data
 	return getResidentData(record)
+}
+
+// StreamFileByInode writes a file's data to w by inode without ever
+// buffering the whole file in memory, and returns the number of bytes written.
+// Intended for files whose true size exceeds maxArtifactBytes.
+func (s *Session) StreamFileByInode(inode uint64, w io.Writer) (uint64, error) {
+	record := getRecordByInode(s.mftData, inode, s.recordSize)
+	if record == nil {
+		return 0, fmt.Errorf("record for inode %d not found in MFT", inode)
+	}
+	runs, realSize, err := s.collectDataRuns(record)
+	if err != nil {
+		return 0, err
+	}
+	if len(runs) == 0 {
+		// Resident data is capped at roughly one MFT record's size by
+		// definition (a few hundred bytes to ~1KB), so it's always safe to
+		// materialize directly rather than needing a real streaming path.
+		data, err := getResidentData(record)
+		if err != nil {
+			return 0, err
+		}
+		n, err := w.Write(data)
+		return uint64(n), err
+	}
+	return s.handle.readRunsToWriter(runs, realSize, w)
+}
+
+// StreamThresholdBytes returns the threshold for switching between
+// buffered reading and streaming. 0 means no threshold.
+func StreamThresholdBytes() uint64 {
+	return maxArtifactBytes
+}
+
+// trueDataSize returns the logical $DATA size for a record by using
+// collectDataRuns as the source of truth to properly handle extension
+// records via $ATTRIBUTE_LIST. getDataSize is used only as a fallback
+// for resident data.
+func (s *Session) trueDataSize(record []byte) uint64 {
+	if _, realSize, err := s.collectDataRuns(record); err == nil && realSize > 0 {
+		return realSize
+	}
+	return getDataSize(record)
 }
 
 // GetFileSizeByInode returns the logical size of a file ($DATA size) in bytes by inode.
@@ -1315,39 +1116,16 @@ func (s *Session) GetFileSizeByInode(inode uint64) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return getDataSize(record), nil
+	return s.trueDataSize(record), nil
 }
 
 // findRecordByInode returns the MFT record for a given actual inode number.
 func (s *Session) findRecordByInode(inode uint64) ([]byte, error) {
-	// fast path
-	recStart := inode * s.recordSize
-	recEnd := recStart + s.recordSize
-	if recEnd <= uint64(len(s.mftData)) {
-		record := s.mftData[recStart:recEnd]
-		if isValidFileRecord(record) && len(record) >= 0x30 {
-			if uint64(binary.LittleEndian.Uint32(record[0x2C:0x30])) == inode {
-				return record, nil
-			}
-		}
+	record := getRecordByInode(s.mftData, inode, s.recordSize)
+	if record == nil {
+		return nil, fmt.Errorf("inode %d not found", inode)
 	}
-	// linear scan
-	total := uint64(len(s.mftData)) / s.recordSize
-	for i := uint64(0); i < total; i++ {
-		start := i * s.recordSize
-		end := start + s.recordSize
-		if end > uint64(len(s.mftData)) {
-			break
-		}
-		record := s.mftData[start:end]
-		if !isValidFileRecord(record) || len(record) < 0x30 {
-			continue
-		}
-		if uint64(binary.LittleEndian.Uint32(record[0x2C:0x30])) == inode {
-			return record, nil
-		}
-	}
-	return nil, fmt.Errorf("inode %d not found", inode)
+	return record, nil
 }
 
 // getDataSize returns the logical size of the $DATA attribute from an MFT record.
@@ -1474,12 +1252,4 @@ func (s *Session) FindFileInode(relPath string) (uint64, bool) {
 		return 0, false
 	}
 	return inode, true
-}
-
-// joinSessionPath joins a parent directory and a child node name.
-func joinSessionPath(base, name string) string {
-	if base == "" {
-		return name
-	}
-	return base + `\` + name
 }

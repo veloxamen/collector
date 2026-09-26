@@ -1,5 +1,19 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package vault provides RSA-OAEP and AES-256-GCM encryption capabilities
 // for the forensic artifact collector.
 package vault
@@ -52,12 +66,10 @@ func FindPubKeyPath() (string, error) {
 	}
 	exeDir := filepath.Dir(exePath)
 
-	// Search public key file in the executing directory.
 	patterns := []string{"*.pub", "*.pem"}
 	var matches []string
 	for _, p := range patterns {
 		matches, err = filepath.Glob(filepath.Join(exeDir, p))
-		// Exit the loop once a match is found.
 		if err == nil && len(matches) > 0 {
 			break
 		}
@@ -74,7 +86,6 @@ func FindPubKeyPath() (string, error) {
 // include the key identifier in the output filename.
 func KeyBaseName(keyPath string) string {
 	base := filepath.Base(keyPath)
-	// Strip known extensions: .pub, .pem
 	for _, ext := range []string{".pub", ".pem"} {
 		if strings.HasSuffix(strings.ToLower(base), ext) {
 			return base[:len(base)-len(ext)]

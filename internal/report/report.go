@@ -1,3 +1,19 @@
+//go:build windows
+
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package report provides functionality to generate forensic collection reports
 // in text and JSON formats.
 package report
@@ -7,12 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
 	"collector/internal/collect"
 	"collector/internal/config"
+	"collector/internal/humanize"
 )
 
 type entryStatus int
@@ -133,8 +149,8 @@ func (r *Report) updateStatus(i int) {
 // totalBytes calculates the total number of bytes copied.
 func totalBytes(results []collect.ResultSet) uint64 {
 	var t uint64
-	for _, r := range results {
-		t += r.BytesCopied
+	for _, res := range results {
+		t += res.BytesCopied
 	}
 	return t
 }
@@ -166,7 +182,7 @@ func (r *Report) PrintSummary() {
 	fmt.Println()
 }
 
-// WriteText generates the report message for the txt format report.
+// writeText generates the report message for the txt format report.
 func (r *Report) writeText(w io.Writer) {
 	fmt.Fprintln(w, "Artifact Collection Report")
 	fmt.Fprintln(w, "==========================")
@@ -189,7 +205,7 @@ func (r *Report) writeText(w io.Writer) {
 				statusStr = "PARTIAL"
 			}
 			fmt.Fprintf(w, "[%s] [%s] %s\n", statusStr, e.Category, e.Target)
-			fmt.Fprintf(w, "  Files     : %d (%s)\n", len(e.Successes), formatBytes(totalBytes(e.Successes)))
+			fmt.Fprintf(w, "  Files     : %d (%s)\n", len(e.Successes), humanize.FormatBytes(totalBytes(e.Successes)))
 			if len(e.Failures) > 0 {
 				fmt.Fprintln(w, "  Warnings  :")
 				for _, m := range e.Failures {
@@ -201,10 +217,10 @@ func (r *Report) writeText(w io.Writer) {
 			for _, res := range e.Successes {
 				if res.SHA256 != "" {
 					fmt.Fprintf(w, "    - %s (%s)  %s\n",
-						filepath.Base(res.OutputPath), formatBytes(res.BytesCopied), res.SHA256)
+						filepath.Base(res.OutputPath), humanize.FormatBytes(res.BytesCopied), res.SHA256)
 				} else {
 					fmt.Fprintf(w, "    - %s (%s)\n",
-						filepath.Base(res.OutputPath), formatBytes(res.BytesCopied))
+						filepath.Base(res.OutputPath), humanize.FormatBytes(res.BytesCopied))
 				}
 			}
 		case statusSkipped:
@@ -223,17 +239,6 @@ func (r *Report) writeText(w io.Writer) {
 		}
 		fmt.Fprintln(w)
 	}
-}
-
-// SaveText saves the txt format report file.
-func (r *Report) SaveText(path string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	r.writeText(f)
-	return nil
 }
 
 // ToTextBytes converts report contents to the txt format suitable byte array.
@@ -316,16 +321,6 @@ func (r *Report) writeJSON(w io.Writer) error {
 	return enc.Encode(root)
 }
 
-// SaveText saves the JSON format report file.
-func (r *Report) SaveJSON(path string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return r.writeJSON(f)
-}
-
 // ToJSONBytes converts report contents to the JSON report suitable byte array.
 func (r *Report) ToJSONBytes() ([]byte, error) {
 	var buf bytes.Buffer
@@ -333,25 +328,6 @@ func (r *Report) ToJSONBytes() ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-// formatBytes converts a byte count into a human-readable string with appropriate units.
-func formatBytes(b uint64) string {
-	const (
-		KB = uint64(1024)
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case b >= GB:
-		return fmt.Sprintf("%.2f GB", float64(b)/float64(GB))
-	case b >= MB:
-		return fmt.Sprintf("%.2f MB", float64(b)/float64(MB))
-	case b >= KB:
-		return fmt.Sprintf("%.2f KB", float64(b)/float64(KB))
-	default:
-		return fmt.Sprintf("%d bytes", b)
-	}
 }
 
 type memoryDumpInfo struct {

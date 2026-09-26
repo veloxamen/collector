@@ -1,5 +1,19 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package vault provides RSA-OAEP and AES-256-GCM encryption capabilities
 // for the forensic artifact collector.
 package vault
@@ -12,16 +26,20 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 )
 
 const (
 	// Magic is the file signature for identifying the collector's encrypted files.
 	Magic = "VXMN0001"
+
 	// ChunkSize defines the maximum size of buffered plaintext before encryption (64 MB).
 	ChunkSize = 64 * 1024 * 1024
+
 	// AESKeyLen is the length of the AES-256 key in bytes.
 	AESKeyLen = 32
+
 	// GCMNonceLen is the standard nonce size for AES-GCM.
 	GCMNonceLen = 12
 )
@@ -34,7 +52,7 @@ type EncWriter struct {
 }
 
 // NewEncWriter creates an encrypted file at dstPath using the RSA public key.
-// rsa.PublicKey: 2048-bit or higher is recommended
+// A 2048-bit or higher RSA public key is recommended.
 func NewEncWriter(dstPath string, pub *rsa.PublicKey) (*EncWriter, error) {
 	aesKey := make([]byte, AESKeyLen)
 	if _, err := rand.Read(aesKey); err != nil {
@@ -81,6 +99,45 @@ func NewEncWriter(dstPath string, pub *rsa.PublicKey) (*EncWriter, error) {
 	return &EncWriter{dst: dst, gcm: gcm, buf: make([]byte, 0, ChunkSize)}, nil
 }
 
+// WriteEntryStream writes a named data entry into the encrypted stream,
+// reading the body from r instead of requiring it as a single []byte.
+// The size parameter must match the exact number of bytes r will yield.
+func (w *EncWriter) WriteEntryStream(name string, size uint64, r io.Reader) error {
+	nameBytes := []byte(name)
+	var hdr [12]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(nameBytes)))
+	binary.BigEndian.PutUint64(hdr[4:12], size)
+
+	if err := w.writeRaw(hdr[:]); err != nil {
+		return err
+	}
+	if err := w.writeRaw(nameBytes); err != nil {
+		return err
+	}
+
+	buf := make([]byte, 16<<20) // 16 MiB
+	var total uint64
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			if err := w.writeRaw(buf[:n]); err != nil {
+				return err
+			}
+			total += uint64(n)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("stream read failed for entry %q: %w", name, rerr)
+		}
+	}
+	if total != size {
+		return fmt.Errorf("entry %q: streamed %d bytes but declared size was %d", name, total, size)
+	}
+	return nil
+}
+
 // WriteEntry writes a named data entry into the encrypted stream.
 func (w *EncWriter) WriteEntry(name string, data []byte) error {
 	nameBytes := []byte(name)
@@ -104,7 +161,6 @@ func (w *EncWriter) Close() error {
 			return err
 		}
 	}
-	// Finalize stream with a termination marker.
 	var zero [4]byte
 	if _, err := w.dst.Write(zero[:]); err != nil {
 		return err
@@ -141,7 +197,6 @@ func (w *EncWriter) flush() error {
 		return fmt.Errorf("nonce generation failed: %w", err)
 	}
 
-	// Output format: [Nonce(12B)][Ciphertext]
 	ct := w.gcm.Seal(nonce, nonce, w.buf, nil)
 
 	var lenBuf [4]byte

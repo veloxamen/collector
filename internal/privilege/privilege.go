@@ -1,13 +1,24 @@
 //go:build windows
 
+// Copyright 2026 CrabCanneryShip
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package privilege handles UAC self-elevation and Windows-specific privilege management.
 package privilege
 
 import (
 	"fmt"
-	"os"
-	"strings"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -31,30 +42,7 @@ func IsAdmin() bool {
 	return err == nil && member
 }
 
-// RelaunchElevated attempts to re-launch the current executable with the "runas" verb.
-func RelaunchElevated() error {
-	verb, _ := syscall.UTF16PtrFromString("runas")
-	exe, _ := syscall.UTF16PtrFromString(os.Args[0])
-	argStr := buildArgString(os.Args[1:])
-	argPtr, _ := syscall.UTF16PtrFromString(argStr)
-
-	shell32 := syscall.NewLazyDLL("shell32.dll")
-	shellExec := shell32.NewProc("ShellExecuteW")
-	r, _, _ := shellExec.Call(
-		0,
-		uintptr(unsafe.Pointer(verb)),
-		uintptr(unsafe.Pointer(exe)),
-		uintptr(unsafe.Pointer(argPtr)),
-		0,
-		1, // SW_SHOWNORMAL
-	)
-	if r <= 32 {
-		return fmt.Errorf("ShellExecuteW returned %d", r)
-	}
-	return nil
-}
-
-// buildArgString escapes and joins command-line arguments.
+// EnableBackupPrivilege enables backup and security-related privileges on the current process token.
 func EnableBackupPrivilege() error {
 	privs := []string{
 		"SeBackupPrivilege",
@@ -77,7 +65,7 @@ func EnableBackupPrivilege() error {
 	return nil
 }
 
-// EnableBackupPrivilege enables SeBackupPrivilege on the current process token.
+// enablePrivilege enables a specified privilege on the provided process token.
 func enablePrivilege(token windows.Token, name string) error {
 	var luid windows.LUID
 	namePtr, err := windows.UTF16PtrFromString(name)
@@ -115,7 +103,10 @@ func enableNamedPrivilege(name string) error {
 	defer token.Close()
 
 	var luid windows.LUID
-	namePtr, _ := windows.UTF16PtrFromString(name)
+	namePtr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return err
+	}
 	if err := windows.LookupPrivilegeValue(nil, namePtr, &luid); err != nil {
 		return fmt.Errorf("LookupPrivilegeValue(%s): %w", name, err)
 	}
@@ -127,22 +118,4 @@ func enableNamedPrivilege(name string) error {
 	}
 	return windows.AdjustTokenPrivileges(token, false, &tp,
 		uint32(unsafe.Sizeof(tp)), nil, nil)
-}
-
-// buildArgString concatenates strings to make command arguments for a new console.
-func buildArgString(args []string) string {
-	var sb strings.Builder
-	for i, a := range args {
-		if i > 0 {
-			sb.WriteByte(' ')
-		}
-		if strings.ContainsAny(a, " \t") {
-			sb.WriteByte('"')
-			sb.WriteString(a)
-			sb.WriteByte('"')
-		} else {
-			sb.WriteString(a)
-		}
-	}
-	return sb.String()
 }
