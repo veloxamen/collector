@@ -2,7 +2,7 @@
 
 **High-Speed Windows Artifact Collection Tool for Cloud-Native DFIR**
 
-`collector` is a lightweight, standalone tool written in **Go**, designed to collect critical Windows artifacts for incident response. It serves as the primary entry point for the **[veloxamen](https://www.google.com/search?q=https://github.com/veloxamen)** forensic pipeline.
+`collector` is a lightweight, standalone tool written in **Go**, designed to collect critical Windows artifacts for incident response. It serves as the primary entry point for the **[veloxamen](https://github.com/veloxamen)** forensic pipeline.
 
 ## ✨ Key Concepts
 
@@ -57,6 +57,8 @@ openssl genrsa -out private.pem 4096
 openssl rsa -in private.pem -pubout -out public.pem
 
 ```
+
+* **Note** For B-D keys, use [decryptor](https://github.com/crabcanneryship/decryptor) to decrypt the resulting encrypted bundle then examine as you like.
 
 ## 💻 Usage
 
